@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	configbytes "example/internal"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 // Константы типов пакетов (как в оригинале)
@@ -22,9 +25,11 @@ const (
 	SelectedServer            = 3121
 	LoginUserReq              = 5100
 	InformationCharacter      = 5101
+	DisplayedCharacter        = 5103
 	CompleteEnterWorld        = 5117
 	CreatePcReq               = 5118
 	CompleteCreateCharacter   = 5119
+	ChoosePcReq               = 5116
 	InfoExpAck                = 5139
 	InventoryCharacteristic   = 5145
 	HealthPointCharacteristic = 5146
@@ -33,6 +38,8 @@ const (
 	DoMoveReq                 = 5188
 	MovedCharacter            = 5189
 	OtherInformationCharacter = 5523
+	ServerTime                = 5651
+	GameConfiguration         = 2012
 )
 
 // Коды ошибок (как в оригинале)
@@ -83,7 +90,7 @@ var BlowfishDecryptKey = []byte{
 	0x75, 0xAA, 0x00, 0x00,
 }
 
-// Функция расшифровки пакетов (портирована из C# кода)
+// Функция расшифровки пакетов (точная портировка из C# кода)
 func BlowfishDecrypt(packet []byte) []byte {
 	if len(packet) == 0 {
 		return packet
@@ -94,28 +101,30 @@ func BlowfishDecrypt(packet []byte) []byte {
 	copy(key, BlowfishDecryptKey)
 
 	// Создаем копию пакета для результата
-	result := make([]byte, len(packet))
-	copy(result, packet)
+	resultPacket := make([]byte, len(packet))
+	copy(resultPacket, packet)
 
 	pointerKey := key[0]
 	v6 := key[1]
 
-	for i := 0; i < len(result); i++ {
-		pointerKey = pointerKey + 1
-		v7 := key[pointerKey+2]
-		v6 = v7 + v6
-		v8 := key[v6+2]
-		key[pointerKey+2] = v8
-		result[i] ^= key[byte(v7+v8)+2]
-		key[v6+2] = v7
+	if len(resultPacket) > 0 {
+		for i := 0; i < len(resultPacket); i++ {
+			pointerKey = byte(pointerKey + 1)
+			v7 := key[pointerKey+2]
+			v6 = byte(v7 + v6)
+			v8 := key[v6+2]
+			key[pointerKey+2] = v8
+			resultPacket[i] ^= key[byte(v7+v8)+2]
+			key[v6+2] = v7
+		}
 	}
 
 	key[1] = v6
 
-	return result
+	return resultPacket
 }
 
-// Функция для извлечения null-terminated строки из массива байтов (аналог C# GetText)
+// Функция для извлечения null-terminated строки из массива байтов с кодировкой Windows-1251
 func getText(data []byte, offset int) string {
 	if offset >= len(data) {
 		return ""
@@ -129,7 +138,15 @@ func getText(data []byte, offset int) string {
 		result = append(result, data[i])
 	}
 
-	return string(result)
+	// Декодируем из Windows-1251 в UTF-8
+	decoder := charmap.Windows1251.NewDecoder()
+	utf8Text, err := decoder.Bytes(result)
+	if err != nil {
+		log.Printf("🐛 Ошибка декодирования Windows-1251: %v", err)
+		return string(result) // fallback к обычной строке
+	}
+
+	return string(utf8Text)
 }
 
 // Вспомогательная функция min
@@ -466,6 +483,8 @@ func (s *R2Server) processPacket(client *ClientSession, data []byte) {
 		s.handleSelectServer(client, packetData)
 	case LoginUserReq:
 		s.handleGameLogin(client, packetData)
+	case ChoosePcReq:
+		s.handleChooseCharacter(client, packetData)
 	case CreatePcReq:
 		s.handleCreateCharacter(client, packetData)
 	case DoMoveReq:
@@ -492,6 +511,18 @@ func (s *R2Server) handleAuthorizationLogin(client *ClientSession, data []byte) 
 		log.Printf("❌ Недостаточно данных для авторизации от %s (получено %d байт)", client.id, len(data))
 		s.sendLoginError(client, NoUser)
 		return
+	}
+
+	// Добавляем подробное логирование для отладки
+	log.Printf("🔍 Размер полученных данных: %d байт", len(data))
+	log.Printf("🔍 Первые 20 байт данных: %v", data[:min(20, len(data))])
+
+	// Проверяем ключевые байты для извлечения логина и пароля
+	if len(data) > 256 {
+		log.Printf("🔍 Байт 256 (для логина): %d", data[256])
+	}
+	if len(data) > 81 {
+		log.Printf("🔍 Байт 81 (для пароля): %d", data[81])
 	}
 
 	// Извлекаем логин по алгоритму из C# кода
@@ -711,7 +742,14 @@ func (s *R2Server) handleGameLogin(client *ClientSession, data []byte) {
 	log.Printf("✅ Игровой логин успешен для клиента %s (аккаунт ID: %d, сессия ID: %d)",
 		client.id, account.ID, session.ID)
 
-	// Отправляем список персонажей
+	// ПРАВИЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ как в оригинальном C# коде:
+	// 1. Время сервера (обязательно)
+	s.sendServerTime(client)
+
+	// 2. Конфигурация игры (обязательна)
+	s.sendGameConfiguration(client)
+
+	// 3. Список персонажей (основной пакет)
 	s.sendCharacterList(client)
 }
 
@@ -875,16 +913,8 @@ func (s *R2Server) sendCharacterList(client *ClientSession) {
 	s.sendBinaryPacket(client, InformationCharacter, buf.Bytes())
 	log.Printf("📋 Отправлен список персонажей клиенту %s (размер %d байт, с тестовым персонажем)", client.id, buf.Len())
 
-	// Отправляем дополнительную информацию о персонажах (пакет 5523)
-	s.sendOtherCharacterInfo(client)
-
-	// Отправляем пакеты характеристик (как в оригинальном сервере)
-	s.sendCompleteEnterWorld(client)
-	s.sendInventoryCharacteristics(client)
-	s.sendHealthPointCharacteristics(client)
-	s.sendSpeedCharacteristics(client)
-	s.sendInfoWeight(client)
-	s.sendInfoExp(client)
+	// НЕ ОТПРАВЛЯЕМ другие пакеты! Они отправляются только после выбора персонажа
+	// Клиент должен выбрать персонажа и отправить пакет ChoosePcReq (5116)
 }
 
 // Отправка дополнительной информации о персонажах (пакет 5523)
@@ -972,6 +1002,44 @@ func (s *R2Server) sendInventoryCharacteristics(client *ClientSession) {
 
 	s.sendBinaryPacket(client, InventoryCharacteristic, buf.Bytes())
 	log.Printf("📋 Отправлены характеристики инвентаря клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка ПОЛНЫХ характеристик способностей (пакет 5145) - правильная версия
+func (s *R2Server) sendInformationAbilityCharacteristics(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	// Полная структура InventoryCharacteristicModel как в C# коде
+	binary.Write(buf, binary.LittleEndian, int16(100)) // DDv - физическая защита
+	binary.Write(buf, binary.LittleEndian, int16(50))  // MDv - магическая защита
+	binary.Write(buf, binary.LittleEndian, int16(25))  // RDv - защита от стрел
+
+	binary.Write(buf, binary.LittleEndian, int16(80)) // DPv - физическая атака
+	binary.Write(buf, binary.LittleEndian, int16(40)) // MPv - магическая атака
+	binary.Write(buf, binary.LittleEndian, int16(30)) // RPv - стрелковая атака
+
+	binary.Write(buf, binary.LittleEndian, int16(20)) // DDD - урон физической атаки
+	binary.Write(buf, binary.LittleEndian, int16(85)) // DHit - точность физической атаки
+
+	binary.Write(buf, binary.LittleEndian, int16(15)) // RDD - урон стрелковой атаки
+	binary.Write(buf, binary.LittleEndian, int16(75)) // RHit - точность стрелковой атаки
+
+	binary.Write(buf, binary.LittleEndian, int16(25)) // MDD - урон магической атаки
+	binary.Write(buf, binary.LittleEndian, int16(70)) // MHit - точность магической атаки
+
+	binary.Write(buf, binary.LittleEndian, int16(15)) // Str - сила
+	binary.Write(buf, binary.LittleEndian, int16(10)) // Dex - ловкость
+	binary.Write(buf, binary.LittleEndian, int16(10)) // Int - интеллект
+
+	binary.Write(buf, binary.LittleEndian, int16(5)) // CriticalHit - критический удар
+
+	binary.Write(buf, binary.LittleEndian, int32(93)) // HpMax - максимальное здоровье
+	binary.Write(buf, binary.LittleEndian, int32(51)) // MpMax - максимальная мана
+
+	// 10 байт заполнения
+	buf.Write(make([]byte, 10))
+
+	s.sendBinaryPacket(client, InventoryCharacteristic, buf.Bytes())
+	log.Printf("🎯 Отправлены ПОЛНЫЕ характеристики способностей клиенту %s (размер %d байт)", client.id, buf.Len())
 }
 
 // Отправка текущего здоровья и маны (пакет 5146)
@@ -1071,6 +1139,148 @@ func (s *R2Server) sendInfoExp(client *ClientSession) {
 
 	s.sendBinaryPacket(client, InfoExpAck, buf.Bytes())
 	log.Printf("📋 Отправлена информация об опыте клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка времени сервера (пакет 5651)
+func (s *R2Server) sendServerTime(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	now := time.Now()
+
+	binary.Write(buf, binary.LittleEndian, int32(0))                        // ServerTick
+	binary.Write(buf, binary.LittleEndian, int16(now.Year()))               // Year
+	binary.Write(buf, binary.LittleEndian, int16(now.Month()))              // Month
+	binary.Write(buf, binary.LittleEndian, int16(now.Weekday()))            // DayOfWeek
+	binary.Write(buf, binary.LittleEndian, int16(now.Day()))                // Day
+	binary.Write(buf, binary.LittleEndian, int16(now.Hour()))               // Hour
+	binary.Write(buf, binary.LittleEndian, int16(now.Minute()))             // Minute
+	binary.Write(buf, binary.LittleEndian, int16(now.Second()))             // Second
+	binary.Write(buf, binary.LittleEndian, int16(now.Nanosecond()/1000000)) // Millisecond
+
+	s.sendBinaryPacket(client, ServerTime, buf.Bytes())
+	log.Printf("🕐 Отправлено время сервера клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка отображения персонажа (пакет 5103)
+func (s *R2Server) sendDisplayedCharacter(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	// PublicPc структура (детальная информация о персонаже)
+	binary.Write(buf, binary.LittleEndian, byte(1))                  // AliveOrDead
+	binary.Write(buf, binary.LittleEndian, int16(800))               // AttackRate
+	binary.Write(buf, binary.LittleEndian, int16(350))               // MoveRate
+	binary.Write(buf, binary.LittleEndian, int32(client.session.ID)) // UniqueIdentifier
+	binary.Write(buf, binary.LittleEndian, byte(0))                  // Class
+	binary.Write(buf, binary.LittleEndian, byte(0))                  // Gender
+	binary.Write(buf, binary.LittleEndian, byte(0))                  // Head
+	binary.Write(buf, binary.LittleEndian, byte(0))                  // Face
+
+	// Position (Vector3)
+	binary.Write(buf, binary.LittleEndian, float32(364000.2)) // X
+	binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Z
+	binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Y
+
+	binary.Write(buf, binary.LittleEndian, int16(0)) // Reputation
+
+	// Name (17 bytes)
+	nameBytes := make([]byte, 17)
+	copy(nameBytes, "TestChar")
+	buf.Write(nameBytes)
+
+	binary.Write(buf, binary.LittleEndian, int16(1)) // Level
+	binary.Write(buf, binary.LittleEndian, int32(0)) // ChaoticStatus
+	binary.Write(buf, binary.LittleEndian, int32(0)) // PkCnt
+
+	// Equipment (по 4 байта на каждый предмет экипировки)
+	for i := 0; i < 20; i++ { // 20 слотов экипировки
+		binary.Write(buf, binary.LittleEndian, int32(0))
+	}
+
+	// IsTeleport flag
+	binary.Write(buf, binary.LittleEndian, byte(0))
+
+	// Padding
+	buf.Write(make([]byte, 9))
+
+	s.sendBinaryPacket(client, DisplayedCharacter, buf.Bytes())
+	log.Printf("👤 Отправлено отображение персонажа клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка правильной игровой конфигурации (пакет 2012) как в оригинале
+func (s *R2Server) sendGameConfiguration(client *ClientSession) {
+	// // ПЕРВЫЙ массив байтов - вставьте сюда полные байты из C# кода
+	// gameConfigData1 := []byte{
+	// 	// ВСТАВЬТЕ СЮДА ПЕРВЫЙ МАССИВ БАЙТОВ ИЗ C# КОДА
+	// 	// (тот что в первом client.SendOnlyBytesForDelevop)
+	// }
+
+	// // ВТОРОЙ массив байтов - вставьте сюда полные байты из C# кода
+	// gameConfigData2 := []byte{
+	// 	// ВСТАВЬТЕ СЮДА ВТОРОЙ МАССИВ БАЙТОВ ИЗ C# КОДА
+	// 	// (тот что во втором client.SendOnlyBytesForDelevop)
+	// }
+
+	// Отправляем оба пакета конфигурации
+	s.sendBinaryPacket(client, GameConfiguration, configbytes.GameConfigData1)
+	s.sendBinaryPacket(client, GameConfiguration, configbytes.GameConfigData2)
+
+	log.Printf("⚙️  Отправлена полная игровая конфигурация клиенту %s", client.id)
+}
+
+// Обработка выбора персонажа (пакет ChoosePcReq 5116)
+func (s *R2Server) handleChooseCharacter(client *ClientSession, data []byte) {
+	if !client.isAuth {
+		log.Printf("❌ Попытка выбора персонажа без авторизации от %s", client.id)
+		return
+	}
+
+	// Извлекаем ID персонажа из пакета
+	var pcNo int32
+	if len(data) >= 4 {
+		reader := bytes.NewReader(data)
+		binary.Read(reader, binary.LittleEndian, &pcNo)
+	} else {
+		pcNo = 1 // По умолчанию первый персонаж
+	}
+
+	log.Printf("🎯 Выбор персонажа ID=%d клиентом %s", pcNo, client.id)
+
+	// Создаем тестового персонажа для входа в мир
+	character := &Character{
+		ID:      int(pcNo),
+		Owner:   client.account.ID,
+		Slot:    0,
+		Name:    "TestChar",
+		Class:   0,
+		Sex:     0,
+		Head:    0,
+		Face:    0,
+		Level:   1,
+		HP:      93,
+		MP:      51,
+		PosX:    364000.2,
+		PosY:    313483.7,
+		PosZ:    12339.71,
+		Str:     15,
+		Dex:     10,
+		Int:     10,
+		RegDate: time.Now(),
+	}
+
+	s.mutex.Lock()
+	client.character = character
+	s.mutex.Unlock()
+
+	log.Printf("✅ Персонаж выбран клиентом %s: %s (ID=%d)", client.id, character.Name, character.ID)
+
+	// ТЕПЕРЬ отправляем пакеты входа в мир (как в оригинальном C# коде)
+	s.sendCompleteEnterWorld(client)
+	s.sendInformationAbilityCharacteristics(client)
+	s.sendHealthPointCharacteristics(client)
+	s.sendSpeedCharacteristics(client)
+	s.sendInfoWeight(client)
+	s.sendInfoExp(client)
+	s.sendDisplayedCharacter(client)
 }
 
 // Обработка создания персонажа
