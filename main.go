@@ -12,16 +12,27 @@ import (
 
 // Константы типов пакетов (как в оригинале)
 const (
-	ConnectionClient        = 1103
-	AuthorizationLogin      = 3100
-	SendServers             = 3101
-	LoginServerError        = 3102
-	RefreshServers          = 3115
-	RefreshedServers        = 3116
-	SelectServer            = 3120
-	SelectedServer          = 3121
-	CreatePcReq             = 5118
-	CompleteCreateCharacter = 5119
+	ConnectionClient          = 1103
+	AuthorizationLogin        = 3100
+	SendServers               = 3101
+	LoginServerError          = 3102
+	RefreshServers            = 3115
+	RefreshedServers          = 3116
+	SelectServer              = 3120
+	SelectedServer            = 3121
+	LoginUserReq              = 5100
+	InformationCharacter      = 5101
+	CompleteEnterWorld        = 5117
+	CreatePcReq               = 5118
+	CompleteCreateCharacter   = 5119
+	InfoExpAck                = 5139
+	InventoryCharacteristic   = 5145
+	HealthPointCharacteristic = 5146
+	SpeedCharacteristic       = 5147
+	InfoWeightAck             = 5149
+	DoMoveReq                 = 5188
+	MovedCharacter            = 5189
+	OtherInformationCharacter = 5523
 )
 
 // Коды ошибок (как в оригинале)
@@ -119,6 +130,14 @@ func getText(data []byte, offset int) string {
 	}
 
 	return string(result)
+}
+
+// Вспомогательная функция min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Извлечение логина из пакета авторизации (портировано из C# кода)
@@ -305,14 +324,34 @@ func (s *R2Server) initTestData() {
 		Password: "CHINA",
 	}
 
-	// Создаем тестовый сервер
+	// Создаем тестовые серверы (все указывают на наш универсальный сервер)
 	s.servers = append(s.servers, ServerModel{
 		ServerId:   1,
 		ServerName: "TestServer",
 		ServerIP:   "127.0.0.1",
-		ServerPort: 8002,
+		ServerPort: 8001, // Тот же порт что и логин-сервер
 		Online:     0,
 		MaxOnline:  100,
+		Status:     1,
+	})
+
+	s.servers = append(s.servers, ServerModel{
+		ServerId:   2,
+		ServerName: "GameServer",
+		ServerIP:   "127.0.0.1",
+		ServerPort: 8001, // Тот же порт что и логин-сервер
+		Online:     5,
+		MaxOnline:  200,
+		Status:     1,
+	})
+
+	s.servers = append(s.servers, ServerModel{
+		ServerId:   3,
+		ServerName: "PvPServer",
+		ServerIP:   "127.0.0.1",
+		ServerPort: 8001, // Тот же порт что и логин-сервер
+		Online:     12,
+		MaxOnline:  150,
 		Status:     1,
 	})
 }
@@ -334,7 +373,7 @@ func (s *R2Server) Start() error {
 			continue
 		}
 
-		clientId := fmt.Sprintf("%s", conn.RemoteAddr().String())
+		clientId := conn.RemoteAddr().String()
 		client := &ClientSession{
 			conn: conn,
 			id:   clientId,
@@ -425,10 +464,19 @@ func (s *R2Server) processPacket(client *ClientSession, data []byte) {
 		s.handleRefreshServers(client)
 	case SelectServer:
 		s.handleSelectServer(client, packetData)
+	case LoginUserReq:
+		s.handleGameLogin(client, packetData)
 	case CreatePcReq:
 		s.handleCreateCharacter(client, packetData)
+	case DoMoveReq:
+		s.handlePlayerMovement(client, packetData)
 	default:
-		log.Printf("❓ Неизвестный тип пакета: %d от клиента %s", packetType, client.id)
+		log.Printf("❓ Неизвестный тип пакета: %d от клиента %s (размер данных: %d байт)", packetType, client.id, len(packetData))
+		// Показываем первые 50 байт для отладки
+		if len(packetData) > 0 {
+			maxLen := min(len(packetData), 50)
+			log.Printf("📦 Первые %d байт данных: %v", maxLen, packetData[:maxLen])
+		}
 	}
 }
 
@@ -452,20 +500,26 @@ func (s *R2Server) handleAuthorizationLogin(client *ClientSession, data []byte) 
 
 	log.Printf("🔑 Попытка авторизации: логин='%s', пароль='%s' от клиента %s", login, password, client.id)
 
-	s.mutex.RLock()
-	account, exists := s.accounts[login]
-	s.mutex.RUnlock()
+	// s.mutex.RLock()
+	// account, exists := s.accounts[login]
+	// s.mutex.RUnlock()
 
-	if !exists {
-		log.Printf("❌ Аккаунт не найден: %s", login)
-		s.sendLoginError(client, NoUser)
-		return
-	}
+	// if !exists {
+	// 	log.Printf("❌ Аккаунт не найден: %s", login)
+	// 	s.sendLoginError(client, NoUser)
+	// 	return
+	// }
 
-	if account.Password != password {
-		log.Printf("❌ Неверный пароль для аккаунта: %s", login)
-		s.sendLoginError(client, PasswordWrong)
-		return
+	// if account.Password != password {
+	// 	log.Printf("❌ Неверный пароль для аккаунта: %s", login)
+	// 	s.sendLoginError(client, PasswordWrong)
+	// 	return
+	// }
+
+	account := &Account{ // ЗАГЛУШКА
+		ID:       1,
+		Login:    login,
+		Password: password,
 	}
 
 	// Создаем сессию
@@ -496,33 +550,77 @@ func (s *R2Server) sendLoginError(client *ClientSession, errorType int) {
 	s.sendBinaryPacket(client, LoginServerError, buf.Bytes())
 }
 
-// Отправка списка серверов
+// Отправка списка серверов (правильный формат по C# коду)
 func (s *R2Server) sendServersList(client *ClientSession) {
 	buf := &bytes.Buffer{}
 
-	// Простой формат списка серверов
-	binary.Write(buf, binary.LittleEndian, int32(client.account.ID))
-	binary.Write(buf, binary.LittleEndian, int32(client.session.ID))
-	binary.Write(buf, binary.LittleEndian, int32(len(s.servers)))
+	log.Printf("🔍 Формируем список серверов для клиента %s:", client.id)
+	log.Printf("   Account ID: %d", client.account.ID)
+	log.Printf("   Session ID: %d", client.session.ID)
+	log.Printf("   Количество серверов: %d", len(s.servers))
 
-	for _, server := range s.servers {
-		binary.Write(buf, binary.LittleEndian, int32(server.ServerId))
-		// Записываем имя сервера (фиксированная длина 20 байт)
-		nameBytes := make([]byte, 20)
+	// Заголовок пакета серверов (правильный формат)
+	binary.Write(buf, binary.LittleEndian, int32(client.account.ID)) // Account ID (4 байта)
+	binary.Write(buf, binary.LittleEndian, int32(client.session.ID)) // Session ID (4 байта)
+	binary.Write(buf, binary.LittleEndian, byte(len(s.servers)))     // Количество серверов (1 байт!)
+
+	// Информация о каждом сервере (правильный формат)
+	for i, server := range s.servers {
+		log.Printf("   Сервер %d: ID=%d, Name='%s', IP='%s', Port=%d, Status=%d",
+			i+1, server.ServerId, server.ServerName, server.ServerIP,
+			server.ServerPort, server.Status)
+
+		// Status (1 байт: 0x01=онлайн, 0x00=офлайн)
+		statusByte := byte(0x00)
+		if server.Status == 1 {
+			statusByte = 0x01
+		}
+		binary.Write(buf, binary.LittleEndian, statusByte)
+
+		// Server ID (2 байта - short!)
+		binary.Write(buf, binary.LittleEndian, int16(server.ServerId))
+
+		// Server Name (101 байт - не 20!)
+		nameBytes := make([]byte, 101)
 		copy(nameBytes, server.ServerName)
 		buf.Write(nameBytes)
-		// IP адрес (фиксированная длина 16 байт)
-		ipBytes := make([]byte, 16)
-		copy(ipBytes, server.ServerIP)
-		buf.Write(ipBytes)
-		binary.Write(buf, binary.LittleEndian, int32(server.ServerPort))
-		binary.Write(buf, binary.LittleEndian, int32(server.Online))
-		binary.Write(buf, binary.LittleEndian, int32(server.MaxOnline))
-		binary.Write(buf, binary.LittleEndian, int32(server.Status))
+
+		// Congestion (1 байт: загруженность сервера)
+		congestion := byte(0) // Low
+		if server.Online > server.MaxOnline/2 {
+			congestion = 1 // Medium
+		}
+		if server.Online > server.MaxOnline*3/4 {
+			congestion = 2 // High
+		}
+		binary.Write(buf, binary.LittleEndian, congestion)
+
+		// IP Address (4 байта - по байту на каждую часть)
+		ipParts := []byte{127, 0, 0, 1} // 127.0.0.1
+		buf.Write(ipParts)
+
+		// Port (2 байта - short, big endian!)
+		portBytes := make([]byte, 2)
+		portBytes[0] = byte((server.ServerPort >> 8) & 0xFF)
+		portBytes[1] = byte(server.ServerPort & 0xFF)
+		buf.Write(portBytes)
+
+		// Server Type (1 байт: 0x01=обычный сервер)
+		binary.Write(buf, binary.LittleEndian, byte(0x01))
+
+		// Hidden (1 байт: 0x00=показан)
+		binary.Write(buf, binary.LittleEndian, byte(0x00))
+
+		// 6 нулевых байтов
+		buf.Write(make([]byte, 6))
 	}
 
-	s.sendBinaryPacket(client, SendServers, buf.Bytes())
-	log.Printf("📋 Отправлен список серверов клиенту %s", client.id)
+	packetData := buf.Bytes()
+	log.Printf("📦 Размер пакета серверов: %d байт", len(packetData))
+	log.Printf("📦 Первые 50 байт пакета: %v", packetData[:min(50, len(packetData))])
+
+	s.sendBinaryPacket(client, SendServers, packetData)
+	log.Printf("📋 Отправлен список серверов клиенту %s (пакет тип %d)", client.id, SendServers)
 }
 
 // Обработка обновления списка серверов
@@ -538,19 +636,441 @@ func (s *R2Server) handleSelectServer(client *ClientSession, data []byte) {
 		return
 	}
 
+	// Извлекаем ID выбранного сервера из пакета
 	serverId := 1
+	if len(data) >= 4 {
+		reader := bytes.NewReader(data)
+		var selectedId int32
+		binary.Read(reader, binary.LittleEndian, &selectedId)
+		serverId = int(selectedId)
+	}
+
 	log.Printf("🎯 Выбор сервера %d клиентом %s", serverId, client.id)
+
+	// Проверяем что сервер существует
+	serverExists := false
+	for _, server := range s.servers {
+		if server.ServerId == serverId {
+			serverExists = true
+			break
+		}
+	}
+
+	if !serverExists {
+		log.Printf("❌ Сервер %d не найден", serverId)
+		s.sendLoginError(client, IncorrectServer)
+		return
+	}
 
 	s.mutex.Lock()
 	client.session.ServerId = serverId
 	s.mutex.Unlock()
 
-	// Подтверждаем выбор сервера
+	// Подтверждаем выбор сервера (правильный формат - 4 нулевых байта)
 	buf := &bytes.Buffer{}
-	binary.Write(buf, binary.LittleEndian, int32(0)) // Успех
+	buf.Write(make([]byte, 4)) // 4 нулевых байта как в оригинале
 
 	s.sendBinaryPacket(client, SelectedServer, buf.Bytes())
 	log.Printf("✅ Сервер %d выбран клиентом %s", serverId, client.id)
+
+	// ВАЖНО: После выбора сервера клиент ожидает подключения к игровому серверу!
+	// Но мы делаем универсальный сервер, поэтому НЕ отправляем список персонажей сразу
+	// Клиент должен переподключиться к игровому серверу (тому же серверу, но как к игровому)
+	log.Printf("🎮 Клиент должен переподключиться к игровому серверу на порту %d", 8001)
+}
+
+// Обработка игрового логина (когда клиент подключается к игровому серверу)
+func (s *R2Server) handleGameLogin(client *ClientSession, data []byte) {
+	log.Printf("🎮 Получен запрос игрового логина от клиента %s", client.id)
+
+	// Для простоты принимаем любой игровой логин
+	// В реальном сервере здесь проверяется сессия из логин-сервера
+
+	// Создаем игровую сессию
+	account := &Account{
+		ID:       1,
+		Login:    "GameUser",
+		Password: "test",
+	}
+
+	session := &Session{
+		ID:        s.nextId,
+		AccountId: account.ID,
+		ServerId:  1,
+		InGame:    true,
+	}
+
+	s.mutex.Lock()
+	s.sessions[session.ID] = session
+	s.nextId++
+	client.account = account
+	client.session = session
+	client.isAuth = true
+	s.mutex.Unlock()
+
+	log.Printf("✅ Игровой логин успешен для клиента %s (аккаунт ID: %d, сессия ID: %d)",
+		client.id, account.ID, session.ID)
+
+	// Отправляем список персонажей
+	s.sendCharacterList(client)
+}
+
+// Отправка списка персонажей (правильный формат)
+func (s *R2Server) sendCharacterList(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	log.Printf("📋 Отправляем список персонажей клиенту %s (с тестовым персонажем)", client.id)
+
+	// 1 байт - не расшифрованные байты
+	buf.WriteByte(0)
+
+	// 3 слота персонажей (по 144 байта каждый)
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			// Создаем тестового персонажа в первом слоте
+			buf.WriteByte(0)                                 // Есть ли значок гильдии
+			buf.Write(make([]byte, 3))                       // Align
+			binary.Write(buf, binary.LittleEndian, int32(1)) // ID персонажа
+			buf.WriteByte(0)                                 // Class (Fighter)
+			buf.Write(make([]byte, 3))                       // Align
+			buf.WriteByte(0)                                 // Gender (Male)
+			buf.WriteByte(0)                                 // Head
+			buf.WriteByte(0)                                 // Face
+			buf.WriteByte(0)                                 // Body
+		} else {
+			// Пустой слот персонажа - точный формат из парсера
+			buf.WriteByte(0)           // Есть ли значок гильдии
+			buf.Write(make([]byte, 3)) // Align
+			buf.Write(make([]byte, 4)) // ID персонажа (0 = пустой слот)
+			buf.WriteByte(0)           // Class
+			buf.Write(make([]byte, 3)) // Align
+			buf.WriteByte(0)           // Gender
+			buf.WriteByte(0)           // Head
+			buf.WriteByte(0)           // Face
+			buf.WriteByte(0)           // Body
+		}
+		buf.Write(make([]byte, 4))  // GuildNo
+		buf.Write(make([]byte, 4))  // GuildMarkSeq
+		buf.Write(make([]byte, 4))  // GuildGrade
+		buf.Write(make([]byte, 17)) // GuildName
+		buf.WriteByte(0)            // IsAtkTower
+		buf.Write(make([]byte, 2))  // DfnsBenefitLv
+		buf.Write(make([]byte, 4))  // DiscipleNo
+		buf.Write(make([]byte, 4))  // DiscipleMemberType
+		buf.Write(make([]byte, 4))  // Hp
+		buf.Write(make([]byte, 4))  // Mp
+		buf.Write(make([]byte, 2))  // Stomach
+		buf.WriteByte(0)            // StomachStatus
+		buf.Write(make([]byte, 5))  // Align
+		buf.Write(make([]byte, 8))  // Exp
+		if i == 0 {
+			// Уровень и имя для тестового персонажа
+			binary.Write(buf, binary.LittleEndian, int16(1)) // Level
+			// Имя персонажа (15 байт)
+			name := []byte("TestChar")
+			nameBuf := make([]byte, 15)
+			copy(nameBuf, name)
+			buf.Write(nameBuf)
+		} else {
+			buf.Write(make([]byte, 2))  // Level
+			buf.Write(make([]byte, 15)) // Name
+		}
+		buf.Write(make([]byte, 3)) // Align
+		buf.Write(make([]byte, 4)) // ChaosBattleSide
+		buf.Write(make([]byte, 2)) // FieldSvrNo
+		buf.Write(make([]byte, 2)) // Align
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int32(1)) // ID (дублирование)
+		} else {
+			buf.Write(make([]byte, 4)) // ID (дублирование)
+		}
+		buf.Write(make([]byte, 2)) // FieldSvrSeq
+		buf.WriteByte(0)           // EmblemOfHonorSeq
+		buf.WriteByte(0)           // Align
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int16(1)) // Level (дублирование)
+		} else {
+			buf.Write(make([]byte, 2)) // Level (дублирование)
+		}
+		buf.WriteByte(0)           // NationalFlagNo
+		buf.WriteByte(0)           // EmblemOfHonorEffectSeq
+		buf.WriteByte(0)           // TeamRankEffectSeq
+		buf.Write(make([]byte, 3)) // Align
+		buf.Write(make([]byte, 4)) // UTGWMatchGroup
+		buf.Write(make([]byte, 4)) // Align
+		buf.Write(make([]byte, 8)) // ExpToLevelUp
+		buf.Write(make([]byte, 4)) // LastReceiptSection
+	}
+
+	// 3 слота экипировки (по 320 байт каждый) - все пустые
+	for i := 0; i < 3; i++ {
+		// Пустая экипировка - 19 предметов по 16 байт + 16 байт для питомца
+		for j := 0; j < 19; j++ {
+			buf.Write(make([]byte, 8)) // Item ID (ulong)
+			buf.Write(make([]byte, 4)) // Item Type ID (int)
+			buf.Write(make([]byte, 4)) // Не расшифрованные байты
+		}
+		buf.Write(make([]byte, 16)) // Servant (питомец)
+	}
+
+	// 36 нулевых байтов (не расшифрованные)
+	buf.Write(make([]byte, 36))
+
+	// Характеристики персонажей - правильный порядок из оригинального кода
+
+	// Сила персонажей (3 слота по 4 байта)
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int32(15)) // Str для тестового персонажа
+		} else {
+			buf.Write(make([]byte, 4)) // Str
+		}
+	}
+
+	// Интеллект персонажей (3 слота по 4 байта)
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int32(10)) // Int для тестового персонажа
+		} else {
+			buf.Write(make([]byte, 4)) // Int
+		}
+	}
+
+	// Ловкость персонажей (3 слота по 4 байта)
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int32(10)) // Dex для тестового персонажа
+		} else {
+			buf.Write(make([]byte, 4)) // Dex
+		}
+	}
+
+	// Репутация персонажей (3 слота по 4 байта)
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			binary.Write(buf, binary.LittleEndian, int32(0)) // Chaotic для тестового персонажа
+		} else {
+			buf.Write(make([]byte, 4)) // Chaotic
+		}
+	}
+
+	// Координаты персонажей (3 слота по 12 байт = 3 float каждый)
+	// ВАЖНО: порядок X, Z, Y согласно Vector3.Write() в оригинальном коде
+	for i := 0; i < 3; i++ {
+		if i == 0 {
+			// Координаты для тестового персонажа
+			binary.Write(buf, binary.LittleEndian, float32(364000.2)) // Position X
+			binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Position Z
+			binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Position Y
+		} else {
+			buf.Write(make([]byte, 4)) // Position X (float)
+			buf.Write(make([]byte, 4)) // Position Z (float)
+			buf.Write(make([]byte, 4)) // Position Y (float)
+		}
+	}
+
+	// Не расшифрованные байты в конце
+	buf.Write(make([]byte, 9))
+
+	s.sendBinaryPacket(client, InformationCharacter, buf.Bytes())
+	log.Printf("📋 Отправлен список персонажей клиенту %s (размер %d байт, с тестовым персонажем)", client.id, buf.Len())
+
+	// Отправляем дополнительную информацию о персонажах (пакет 5523)
+	s.sendOtherCharacterInfo(client)
+
+	// Отправляем пакеты характеристик (как в оригинальном сервере)
+	s.sendCompleteEnterWorld(client)
+	s.sendInventoryCharacteristics(client)
+	s.sendHealthPointCharacteristics(client)
+	s.sendSpeedCharacteristics(client)
+	s.sendInfoWeight(client)
+	s.sendInfoExp(client)
+}
+
+// Отправка дополнительной информации о персонажах (пакет 5523)
+func (s *R2Server) sendOtherCharacterInfo(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	// Для тестового персонажа добавляем одну запись
+	binary.Write(buf, binary.LittleEndian, int32(1)) // CharacterId тестового персонажа
+
+	s.sendBinaryPacket(client, OtherInformationCharacter, buf.Bytes())
+	log.Printf("📋 Отправлена дополнительная информация о персонажах клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка пакета подтверждения входа в мир (пакет 5117)
+func (s *R2Server) sendCompleteEnterWorld(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	// Не расшифрованные байты - отображение всех локаций в клиенте
+	buf.Write([]byte{0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00})
+
+	// ID сессии клиента (как в оригинальном коде)
+	binary.Write(buf, binary.LittleEndian, int32(client.session.ID))
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 4))
+
+	// Координаты (X, Z, Y как в Vector3.Write)
+	binary.Write(buf, binary.LittleEndian, float32(364000.2)) // X
+	binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Z
+	binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Y
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 18))
+
+	// Скорость атаки и движения
+	binary.Write(buf, binary.LittleEndian, int16(800)) // AttackRate
+	binary.Write(buf, binary.LittleEndian, int16(350)) // MoveRate
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 2))
+
+	// Координаты повторно
+	binary.Write(buf, binary.LittleEndian, float32(364000.2)) // X
+	binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Z
+	binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Y
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 4))
+
+	// Репутация
+	binary.Write(buf, binary.LittleEndian, int32(0))
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 28))
+
+	// Количество вещей в инвентаре
+	binary.Write(buf, binary.LittleEndian, int16(0))
+
+	// Не расшифрованные байты
+	buf.Write(make([]byte, 6))
+
+	// 240 слотов инвентаря (по 56 байт каждый) - все пустые
+	for i := 0; i < 240; i++ {
+		buf.Write(make([]byte, 56))
+	}
+
+	// Завершающие байты
+	buf.Write(make([]byte, 5))
+
+	s.sendBinaryPacket(client, CompleteEnterWorld, buf.Bytes())
+	log.Printf("📋 Отправлен пакет входа в мир клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка характеристик инвентаря (пакет 5145)
+func (s *R2Server) sendInventoryCharacteristics(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, int32(1))  // Defence
+	binary.Write(buf, binary.LittleEndian, int32(1))  // Level
+	binary.Write(buf, binary.LittleEndian, int16(15)) // Force (Str)
+	binary.Write(buf, binary.LittleEndian, int16(10)) // Adroitness (Dex)
+	binary.Write(buf, binary.LittleEndian, int16(10)) // Intelligence
+	binary.Write(buf, binary.LittleEndian, int32(93)) // HealthPointMax
+	binary.Write(buf, binary.LittleEndian, int32(51)) // MagicPointMax
+
+	s.sendBinaryPacket(client, InventoryCharacteristic, buf.Bytes())
+	log.Printf("📋 Отправлены характеристики инвентаря клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка текущего здоровья и маны (пакет 5146)
+func (s *R2Server) sendHealthPointCharacteristics(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, int16(93)) // HealthPoint
+	binary.Write(buf, binary.LittleEndian, int16(51)) // MagicPoint
+
+	s.sendBinaryPacket(client, HealthPointCharacteristic, buf.Bytes())
+	log.Printf("📋 Отправлены характеристики здоровья клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка характеристик скорости (пакет 5147)
+func (s *R2Server) sendSpeedCharacteristics(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, int16(800))               // SpeedAttack
+	binary.Write(buf, binary.LittleEndian, int16(350))               // SpeedRun
+	binary.Write(buf, binary.LittleEndian, int32(client.session.ID)) // SessionGameId
+
+	s.sendBinaryPacket(client, SpeedCharacteristic, buf.Bytes())
+	log.Printf("📋 Отправлены характеристики скорости клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Обработка движения персонажа (пакет 5188)
+func (s *R2Server) handlePlayerMovement(client *ClientSession, data []byte) {
+	if !client.isAuth {
+		log.Printf("❌ Попытка движения без авторизации от %s", client.id)
+		return
+	}
+
+	if len(data) < 21 {
+		log.Printf("❌ Недостаточно данных для движения от %s (получено %d байт)", client.id, len(data))
+		return
+	}
+
+	// Извлекаем координаты из пакета движения
+	reader := bytes.NewReader(data)
+
+	var sessionId int32
+	var posX, posZ, posY float32
+	var direction, action byte
+
+	binary.Read(reader, binary.LittleEndian, &sessionId)
+	binary.Read(reader, binary.LittleEndian, &posX)
+	binary.Read(reader, binary.LittleEndian, &posZ)
+	binary.Read(reader, binary.LittleEndian, &posY)
+
+	// Пропускаем неизвестные байты
+	reader.Seek(4, 1)
+
+	binary.Read(reader, binary.LittleEndian, &direction)
+	binary.Read(reader, binary.LittleEndian, &action)
+
+	log.Printf("🚶 Движение персонажа от %s: X=%.2f, Y=%.2f, Z=%.2f, направление=%d, действие=%d",
+		client.id, posX, posY, posZ, direction, action)
+
+	// Отправляем подтверждение движения (пакет 5189)
+	s.sendMovementConfirmation(client, sessionId, posX, posZ, posY, direction, action)
+}
+
+// Отправка подтверждения движения (пакет 5189)
+func (s *R2Server) sendMovementConfirmation(client *ClientSession, sessionId int32, posX, posZ, posY float32, direction, action byte) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, sessionId)
+	binary.Write(buf, binary.LittleEndian, posX)
+	binary.Write(buf, binary.LittleEndian, posZ)
+	binary.Write(buf, binary.LittleEndian, posY)
+	binary.Write(buf, binary.LittleEndian, int16(350)) // SpeedRun
+	binary.Write(buf, binary.LittleEndian, direction)
+	binary.Write(buf, binary.LittleEndian, action)
+
+	s.sendBinaryPacket(client, MovedCharacter, buf.Bytes())
+	log.Printf("✅ Отправлено подтверждение движения клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка информации о весе (пакет 5149)
+func (s *R2Server) sendInfoWeight(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, int32(1000)) // MaxWeight
+	binary.Write(buf, binary.LittleEndian, int32(0))    // Weight
+
+	s.sendBinaryPacket(client, InfoWeightAck, buf.Bytes())
+	log.Printf("📋 Отправлена информация о весе клиенту %s (размер %d байт)", client.id, buf.Len())
+}
+
+// Отправка информации об опыте (пакет 5139)
+func (s *R2Server) sendInfoExp(client *ClientSession) {
+	buf := &bytes.Buffer{}
+
+	binary.Write(buf, binary.LittleEndian, int16(1))    // Level
+	binary.Write(buf, binary.LittleEndian, int64(0))    // Exp
+	binary.Write(buf, binary.LittleEndian, int64(1000)) // ExpAim (опыт для следующего уровня)
+
+	s.sendBinaryPacket(client, InfoExpAck, buf.Bytes())
+	log.Printf("📋 Отправлена информация об опыте клиенту %s (размер %d байт)", client.id, buf.Len())
 }
 
 // Обработка создания персонажа
