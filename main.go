@@ -52,6 +52,13 @@ const (
 	NoUserCharSlotBusy = 1234567891
 )
 
+// Константы координат спавна
+const (
+	SPAWN_X = 101000
+	SPAWN_Z = 17000
+	SPAWN_Y = 132000
+)
+
 // Фиксированный ключ Blowfish как в оригинальном сервере
 var LoginServerBlowfishKey = []byte{
 	0xd5, 0x49, 0x82, 0x55, 0x1d, 0x1a, 0x17, 0x2d, 0xbb, 0x4a, 0x45, 0x43, 0xb7, 0x25, 0xe2, 0x18,
@@ -896,10 +903,10 @@ func (s *R2Server) sendCharacterList(client *ClientSession) {
 	// ВАЖНО: порядок X, Z, Y согласно Vector3.Write() в оригинальном коде
 	for i := 0; i < 3; i++ {
 		if i == 0 {
-			// Координаты для тестового персонажа
-			binary.Write(buf, binary.LittleEndian, float32(364000.2)) // Position X
-			binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Position Z
-			binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Position Y
+			// Координаты для тестового персонажа (используем константы)
+			binary.Write(buf, binary.LittleEndian, float32(SPAWN_X)) // Position X
+			binary.Write(buf, binary.LittleEndian, float32(SPAWN_Z)) // Position Z
+			binary.Write(buf, binary.LittleEndian, float32(SPAWN_Y)) // Position Y
 		} else {
 			buf.Write(make([]byte, 4)) // Position X (float)
 			buf.Write(make([]byte, 4)) // Position Z (float)
@@ -941,10 +948,10 @@ func (s *R2Server) sendCompleteEnterWorld(client *ClientSession) {
 	// Не расшифрованные байты
 	buf.Write(make([]byte, 4))
 
-	// Координаты (X, Z, Y как в Vector3.Write)
-	binary.Write(buf, binary.LittleEndian, float32(364000.2)) // X
-	binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Z
-	binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Y
+	// Координаты (X, Z, Y как в Vector3.Write) - используем константы
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_X)) // X
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_Z)) // Z
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_Y)) // Y
 
 	// Не расшифрованные байты
 	buf.Write(make([]byte, 18))
@@ -956,10 +963,10 @@ func (s *R2Server) sendCompleteEnterWorld(client *ClientSession) {
 	// Не расшифрованные байты
 	buf.Write(make([]byte, 2))
 
-	// Координаты повторно
-	binary.Write(buf, binary.LittleEndian, float32(364000.2)) // X
-	binary.Write(buf, binary.LittleEndian, float32(12339.71)) // Z
-	binary.Write(buf, binary.LittleEndian, float32(313483.7)) // Y
+	// Координаты повторно - используем константы
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_X)) // X
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_Z)) // Z
+	binary.Write(buf, binary.LittleEndian, float32(SPAWN_Y)) // Y
 
 	// Не расшифрованные байты
 	buf.Write(make([]byte, 4))
@@ -1403,7 +1410,6 @@ func (s *R2Server) Shutdown() {
 }
 
 func main() {
-	// Создаем сервер
 	server := NewR2Server("127.0.0.1", 8001)
 
 	log.Println("🎮 === R2 Online Сервер Эмулятор (Бинарный протокол) ===")
@@ -1417,7 +1423,6 @@ func main() {
 	log.Println("   ✓ Создание персонажей")
 	log.Println("")
 
-	// Запускаем сервер
 	if err := server.Start(); err != nil {
 		log.Fatalf("💥 Ошибка запуска сервера: %v", err)
 	}
