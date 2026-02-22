@@ -9,7 +9,8 @@ package handler
 
 import (
 	"fmt"
-	"log/slog"
+
+	"go.uber.org/zap"
 
 	"r2server/internal/login"
 	"r2server/internal/network"
@@ -30,6 +31,13 @@ type AuthDeps interface {
 
 	// IsAccountOnline returns true if the account is already logged in.
 	IsAccountOnline(accountID int32) (bool, error)
+
+	// CreateSessionToken stores a token in Redis linking accountID → gameServerID.
+	// The token is sent to the client in SendServers and echoed back in LoginUserReq.
+	CreateSessionToken(accountID int32, serverID int16) (token int32, err error)
+
+	// GetGameServers returns the list of available game servers.
+	GetGameServers() ([]send.GameServer, error)
 }
 
 // HandleAuthorizationLogin handles opcode 3100 — client sends credentials.
@@ -40,7 +48,10 @@ func HandleAuthorizationLogin(deps AuthDeps) login.HandlerFunc {
 			return fmt.Errorf("HandleAuthorizationLogin: decode: %w", err)
 		}
 
-		slog.Info("login attempt", "login", pkt.Login, "remote", "TODO")
+		s.Log().Info("login attempt",
+			zap.String("login", pkt.Login),
+			zap.String("remote", s.RemoteAddr()),
+		)
 
 		// ── 1. Look up account ────────────────────────────────────────────────
 		accountID, hash, err := deps.GetAccountByLogin(pkt.Login)
@@ -71,32 +82,40 @@ func HandleAuthorizationLogin(deps AuthDeps) login.HandlerFunc {
 			}).Encode())
 		}
 
-		// ── 4. Mark session as authenticated ─────────────────────────────────
+		// ── 4. Create session token ───────────────────────────────────────────
+		// Token is sent to the client in SendServers and echoed back by the client
+		// in LoginUserReq (5100) to the game server.
+		token, err := deps.CreateSessionToken(accountID, 0)
+		if err != nil {
+			return fmt.Errorf("HandleAuthorizationLogin: CreateSessionToken: %w", err)
+		}
+
+		// ── 5. Mark session as authenticated ─────────────────────────────────
 		s.AccountID = accountID
+		s.SessionID = token
 		s.Login = pkt.Login
 		s.SetState(login.StateAuthed)
 
-		// ── 5. Send server list ───────────────────────────────────────────────
-		// Delegate to the lobby handler — it knows how to fetch servers.
+		s.Log().Info("session token created",
+			zap.Int32("account_id", accountID),
+			zap.Int32("token", token),
+		)
+
+		// ── 6. Send server list ───────────────────────────────────────────────
 		return sendServerList(s, deps)
 	}
 }
 
 // sendServerList is a shared helper called after auth and on refresh.
 func sendServerList(s *login.Session, deps AuthDeps) error {
-	// TODO: replace with a real server list from DB/config
-	// (implement GetServers in AuthDeps or add a separate ServerListDeps)
-	servers := []send.GameServer{
-		{
-			ServerID:   1,
-			Name:       "R2 Online",
-			IP:         "127.0.0.1",
-			Port:       5000,
-			Type:       1,
-			Status:     true,
-			Congestion: 10,
-		},
+	servers, err := deps.GetGameServers()
+	if err != nil {
+		return fmt.Errorf("sendServerList: GetGameServers: %w", err)
 	}
 
-	return s.Send(opcode.SendServers, (&send.SendServers{Servers: servers}).Encode())
+	return s.Send(opcode.SendServers, (&send.SendServers{
+		AccountID: s.AccountID,
+		SessionID: s.SessionID,
+		Servers:   servers,
+	}).Encode())
 }

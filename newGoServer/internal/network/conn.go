@@ -9,14 +9,23 @@
 //	[DATA: bytes...]   — payload
 //
 // SIZE = 2 (ENC+SEQ) + 2 (OP) + len(DATA) + 2 (the SIZE field itself) = 6 + len(DATA)
+//
+// Encryption model (discovered from reference implementation):
+//   - Server → Client: always PLAINTEXT (enc_flag = 0x00).
+//   - Client → Server: RC4-encrypted (enc_flag = 0x01) using a hardcoded S-box
+//     (crypto.DecryptSbox). The cipher is RESET to the initial S-box state for
+//     every incoming packet — state does NOT carry over between packets.
 package network
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+
+	"go.uber.org/zap"
 
 	"r2server/internal/crypto"
 )
@@ -30,28 +39,37 @@ const (
 	maxPacketSize = 64 * 1024
 )
 
-// Conn is a single TCP connection with R2 Online packet framing and optional RC4 encryption.
-// It is safe to call Send from multiple goroutines; reads must be called from a single goroutine.
+// Conn is a single TCP connection with R2 Online packet framing.
+// Sends are always plaintext. Receives are decrypted per-packet when enc_flag = 0x01.
+// It is safe to call Send from multiple goroutines; reads must be from a single goroutine.
 type Conn struct {
 	conn net.Conn
+	log  *zap.Logger
 
-	mu         sync.Mutex
-	sendCipher *crypto.RC4 // nil until SetCipher is called
+	mu sync.Mutex
 
-	recvCipher *crypto.RC4 // nil until SetCipher is called
+	// recvSboxSet is true once SetRecvSbox has been called.
+	// When set, incoming packets with enc_flag=0x01 are decrypted using a fresh
+	// RC4 instance seeded from recvSbox for each packet.
+	recvSboxSet bool
+	recvSbox    [256]byte
 }
 
-func NewConn(c net.Conn) *Conn {
-	return &Conn{conn: c}
+func NewConn(c net.Conn, log *zap.Logger) *Conn {
+	return &Conn{
+		conn: c,
+		log:  log.With(zap.String("remote", c.RemoteAddr().String())),
+	}
 }
 
-// SetCipher installs the RC4 cipher for both directions.
-// Call this after sending ConnectionClient (1103) and receiving the client's first encrypted packet.
-func (c *Conn) SetCipher(key [256]byte) {
+// SetRecvSbox installs the S-box used to decrypt incoming (client→server) packets.
+// The cipher is reset to this initial S-box state for every received packet.
+// Server→client packets are always sent as plaintext.
+func (c *Conn) SetRecvSbox(sbox [256]byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.sendCipher = crypto.NewRC4(key)
-	c.recvCipher = crypto.NewRC4(key)
+	c.recvSbox = sbox
+	c.recvSboxSet = true
 }
 
 // RemoteAddr returns the remote address of the connection.
@@ -64,73 +82,113 @@ func (c *Conn) Close() error {
 	return c.conn.Close()
 }
 
-// Send serialises and writes a packet to the wire.
-// If a cipher has been set, the [ENC+SEQ+OP+DATA] portion is encrypted.
+// Send serialises and writes a packet to the wire as plaintext (enc_flag = 0x00).
 func (c *Conn) Send(opcode uint16, payload []byte) error {
-	// Build inner: [ENC][SEQ][OP_LO][OP_HI][DATA...]
+	// Build frame: [SIZE][ENC=0x00][SEQ][OP_LO][OP_HI][DATA...]
 	inner := make([]byte, 4+len(payload))
+	inner[0] = encPlain
 	inner[1] = defaultSeq
 	binary.LittleEndian.PutUint16(inner[2:], opcode)
 	copy(inner[4:], payload)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.sendCipher != nil {
-		inner[0] = encEncrypted
-		c.sendCipher.Crypt(inner[1:]) // encrypt SEQ + OP + DATA (not the flag itself)
-	} else {
-		inner[0] = encPlain
-	}
-
-	// Prepend SIZE = len(inner) + 2 (the size field itself)
 	size := uint16(len(inner) + 2)
 	frame := make([]byte, 2+len(inner))
 	binary.LittleEndian.PutUint16(frame[:2], size)
 	copy(frame[2:], inner)
 
+	if ce := c.log.Check(zap.DebugLevel, "→ SEND"); ce != nil {
+		preview := payload
+		if len(preview) > 64 {
+			preview = preview[:64]
+		}
+		ce.Write(
+			zap.String("op", fmt.Sprintf("0x%04X(%d)", opcode, opcode)),
+			zap.String("enc", "plain"),
+			zap.Int("payload_len", len(payload)),
+			zap.String("payload_hex", hex.EncodeToString(preview)),
+		)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, err := c.conn.Write(frame)
 	return err
 }
 
 // Recv reads one packet from the wire and returns (opcode, payload, error).
 // Blocks until a complete packet is available or an error occurs.
+// If enc_flag == 0x01 and SetRecvSbox has been called, the body is decrypted
+// using a fresh RC4 instance (per-packet reset).
 func (c *Conn) Recv() (opcode uint16, payload []byte, err error) {
-	// Read SIZE (2 bytes)
+	// Read SIZE (2 bytes) — always plaintext
 	var sizeBuf [2]byte
 	if _, err = io.ReadFull(c.conn, sizeBuf[:]); err != nil {
 		return 0, nil, fmt.Errorf("conn: read size: %w", err)
 	}
 	size := binary.LittleEndian.Uint16(sizeBuf[:])
+
+	if ce := c.log.Check(zap.DebugLevel, "← RECV size"); ce != nil {
+		ce.Write(
+			zap.String("raw", hex.EncodeToString(sizeBuf[:])),
+			zap.Uint16("size", size),
+		)
+	}
+
 	if size < 6 {
-		return 0, nil, fmt.Errorf("conn: packet too small: size=%d", size)
+		return 0, nil, fmt.Errorf("conn: packet too small: size=%d (raw: %s)", size, hex.EncodeToString(sizeBuf[:]))
 	}
 	if int(size) > maxPacketSize {
 		return 0, nil, fmt.Errorf("conn: packet too large: size=%d", size)
 	}
 
-	// Read the rest: [ENC][SEQ][OP][DATA...]
+	// Read the rest: [ENC][SEQ][OP_LO][OP_HI][DATA...]
 	inner := make([]byte, size-2)
 	if _, err = io.ReadFull(c.conn, inner); err != nil {
 		return 0, nil, fmt.Errorf("conn: read body: %w", err)
 	}
 
 	encFlag := inner[0]
+	seq := inner[1]
 	body := inner[1:] // [SEQ][OP_LO][OP_HI][DATA...]
 
 	if encFlag == encEncrypted {
-		if c.recvCipher == nil {
-			return 0, nil, fmt.Errorf("conn: encrypted packet but cipher not set")
+		c.mu.Lock()
+		sboxSet := c.recvSboxSet
+		sbox := c.recvSbox
+		c.mu.Unlock()
+
+		if !sboxSet {
+			return 0, nil, fmt.Errorf("conn: encrypted packet but recv sbox not set")
 		}
-		c.recvCipher.Crypt(body) // decrypt in-place
+		// Fresh RC4 instance for this packet — state does not persist between packets.
+		cipher := crypto.NewRC4(sbox)
+		cipher.Crypt(body)
 	}
 
 	// body: [SEQ: 1][OP: 2][DATA: N]
 	if len(body) < 3 {
-		return 0, nil, fmt.Errorf("conn: body too short after flag: %d bytes", len(body))
+		return 0, nil, fmt.Errorf("conn: body too short: %d bytes", len(body))
 	}
-	// seq := body[0]  // available if needed for anti-replay checks
 	opcode = binary.LittleEndian.Uint16(body[1:3])
 	payload = body[3:]
+
+	if ce := c.log.Check(zap.DebugLevel, "← RECV"); ce != nil {
+		encStr := "plain"
+		if encFlag == encEncrypted {
+			encStr = "rc4(fresh)"
+		}
+		preview := payload
+		if len(preview) > 64 {
+			preview = preview[:64]
+		}
+		ce.Write(
+			zap.String("op", fmt.Sprintf("0x%04X(%d)", opcode, opcode)),
+			zap.String("enc", encStr),
+			zap.Uint8("seq", seq),
+			zap.Int("payload_len", len(payload)),
+			zap.String("payload_hex", hex.EncodeToString(preview)),
+		)
+	}
+
 	return opcode, payload, nil
 }

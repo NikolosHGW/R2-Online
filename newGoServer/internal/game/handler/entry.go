@@ -4,7 +4,8 @@ package handler
 import (
 	"context"
 	"fmt"
-	"log/slog"
+
+	"go.uber.org/zap"
 
 	"r2server/internal/game"
 	"r2server/internal/network"
@@ -46,8 +47,10 @@ func HandleLoginUserReq(srv *game.Server, deps EntryDeps) game.HandlerFunc {
 		// ── 1. Validate session token from Redis ──────────────────────────────
 		accountID, err := deps.ValidateToken(ctx, pkt.SessionID)
 		if err != nil || accountID == 0 {
-			slog.Warn("game: invalid session token",
-				"token", pkt.SessionID, "remote", "TODO")
+			s.Log().Warn("invalid session token",
+				zap.Int32("token", pkt.SessionID),
+				zap.Error(err),
+			)
 			return s.Send(opcode.GameServerError, (&send.GameServerError{
 				ErrorCode: send.ErrNoUserNotLogin,
 			}).Encode())
@@ -55,10 +58,9 @@ func HandleLoginUserReq(srv *game.Server, deps EntryDeps) game.HandlerFunc {
 
 		s.AccountID = accountID
 		s.SetState(game.StateCharSelect)
-		srv.AddSession(accountID, s) // exported below
+		srv.AddSession(accountID, s)
 
-		slog.Info("game: account logged in",
-			"account", accountID, "remote", "TODO")
+		s.Log().Info("account logged in", zap.Int32("account_id", accountID))
 
 		// ── 2. Load characters from DB ────────────────────────────────────────
 		chars, err := deps.GetCharactersByOwner(ctx, accountID)

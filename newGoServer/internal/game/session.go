@@ -1,7 +1,9 @@
 package game
 
 import (
-	"log/slog"
+	"fmt"
+
+	"go.uber.org/zap"
 
 	"r2server/internal/network"
 	"r2server/internal/packet/opcode"
@@ -21,6 +23,7 @@ type Session struct {
 	conn   *network.Conn
 	server *Server
 	state  State
+	log    *zap.Logger
 
 	// Populated after LoginUserReq is validated
 	AccountID int32
@@ -30,19 +33,24 @@ type Session struct {
 }
 
 func newSession(conn *network.Conn, srv *Server) *Session {
-	return &Session{conn: conn, server: srv}
+	return &Session{
+		conn:   conn,
+		server: srv,
+		log:    srv.log.With(zap.String("remote", conn.RemoteAddr().String())),
+	}
 }
+
+// Log returns the session-scoped logger (for use in handlers).
+func (s *Session) Log() *zap.Logger { return s.log }
+
+// RemoteAddr returns the remote address as a string.
+func (s *Session) RemoteAddr() string { return s.conn.RemoteAddr().String() }
 
 func (s *Session) SetState(st State) { s.state = st }
 
 // Send encodes the packet payload and writes it to the wire.
 func (s *Session) Send(op opcode.Opcode, payload []byte) error {
 	return s.conn.Send(op, payload)
-}
-
-// SetCipher installs the RC4 cipher on the underlying connection.
-func (s *Session) SetCipher(key [256]byte) {
-	s.conn.SetCipher(key)
 }
 
 // Close closes the underlying TCP connection.
@@ -52,30 +60,33 @@ func (s *Session) Close() {
 
 // run is the session read loop — blocks until the connection closes.
 func (s *Session) run() {
+	s.log.Info("game session started")
 	defer func() {
 		s.conn.Close()
-		slog.Info("game session closed",
-			"remote", s.conn.RemoteAddr(),
-			"account", s.AccountID,
-			"character", s.CharacterID,
+		s.log.Info("game session closed",
+			zap.Int32("account", s.AccountID),
+			zap.Int32("character", s.CharacterID),
 		)
-		// Notify server so it can clean up world state
 		s.server.onSessionEnd(s)
 	}()
 
 	for {
 		op, data, err := s.conn.Recv()
 		if err != nil {
-			slog.Debug("game recv", "remote", s.conn.RemoteAddr(), "err", err)
+			s.log.Debug("recv error", zap.Error(err))
 			return
 		}
 
+		s.log.Info("packet received",
+			zap.String("op", fmt.Sprintf("0x%04X(%d)", op, op)),
+			zap.Int("payload_len", len(data)),
+		)
+
 		r := network.NewReader(data)
-		if err := s.server.dispatch(s, op, r); err != nil {
-			slog.Warn("game dispatch error",
-				"remote", s.conn.RemoteAddr(),
-				"opcode", op,
-				"err", err,
+		if err := s.server.dispatch(s, opcode.Opcode(op), r); err != nil {
+			s.log.Warn("dispatch error",
+				zap.String("op", fmt.Sprintf("0x%04X(%d)", op, op)),
+				zap.Error(err),
 			)
 		}
 	}

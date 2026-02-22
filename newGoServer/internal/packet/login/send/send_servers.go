@@ -20,16 +20,25 @@ type GameServer struct {
 
 // SendServers is opcode 3101 — full server list.
 //
-// Binary layout per server (119 bytes):
+// Binary layout:
 //
-//	[Status: uint8] [ServerId: int16] [Name: 101 bytes CP-1251]
-//	[Congestion: uint8] [IP: 4 bytes] [Port: uint16 BE] [Type: uint8] [Hidden: uint8] [Pad: 6 bytes]
+//	[AccountId: int32] [SessionId: int32] [Count: uint8]
+//	Per server (119 bytes):
+//	  [Status: uint8] [ServerId: int16] [Name: 101 bytes CP-1251]
+//	  [Congestion: uint8] [IP: 4 bytes] [Port: uint16 BE] [Type: uint8] [Hidden: uint8] [Pad: 6 bytes]
+//
+// The client reads AccountId and SessionId from this packet and sends them
+// back to the game server in LoginUserReq (5100).
 type SendServers struct {
-	Servers []GameServer
+	AccountID int32
+	SessionID int32
+	Servers   []GameServer
 }
 
 func (p *SendServers) Encode() []byte {
 	w := network.NewWriter()
+	w.WriteInt32(p.AccountID)
+	w.WriteInt32(p.SessionID)
 	w.WriteUint8(uint8(len(p.Servers)))
 	for _, s := range p.Servers {
 		writeServerEntry(w, s)

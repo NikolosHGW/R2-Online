@@ -37,6 +37,6 @@ func (s *Server) ListenAndServe() error {
 			continue
 		}
 		s.log.Info("new connection", zap.String("remote", rawConn.RemoteAddr().String()))
-		go s.onAccept(NewConn(rawConn))
+		go s.onAccept(NewConn(rawConn, s.log))
 	}
 }

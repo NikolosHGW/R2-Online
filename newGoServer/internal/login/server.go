@@ -11,9 +11,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"r2server/internal/crypto"
 	"r2server/internal/network"
-	"r2server/internal/packet/opcode"
 	"r2server/internal/packet/login/send"
+	"r2server/internal/packet/opcode"
 )
 
 // HandlerFunc is the function signature for all login server packet handlers.
@@ -46,7 +47,6 @@ func (s *Server) ListenAndServe() error {
 // onAccept is called in a goroutine for every new TCP connection.
 func (s *Server) onAccept(conn *network.Conn) {
 	// Server always speaks first: send the 198-byte welcome challenge.
-	// No RC4 cipher is installed — login server is always plaintext.
 	pkt := &send.ConnectionClient{}
 	if err := conn.Send(opcode.ConnectionClient, pkt.Encode()); err != nil {
 		s.log.Warn("failed to send ConnectionClient",
@@ -56,6 +56,12 @@ func (s *Server) onAccept(conn *network.Conn) {
 		conn.Close()
 		return
 	}
+
+	// Client encrypts subsequent packets with RC4 using DecryptSbox.
+	// The cipher is reset per-packet (fresh S-box state for each received packet).
+	// Server responses are always plaintext.
+	conn.SetRecvSbox(crypto.DecryptSbox)
+
 	s.log.Info("client connected, welcome sent", zap.String("remote", conn.RemoteAddr().String()))
 	sess := newSession(conn, s)
 	sess.run()

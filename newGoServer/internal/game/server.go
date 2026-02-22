@@ -18,9 +18,9 @@ import (
 
 	"go.uber.org/zap"
 
+	"r2server/internal/crypto"
 	"r2server/internal/network"
 	"r2server/internal/packet/game/send"
-	loginsend "r2server/internal/packet/login/send"
 	"r2server/internal/packet/opcode"
 )
 
@@ -70,9 +70,7 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) onAccept(conn *network.Conn) {
 	sess := newSession(conn, s)
 
-	// Send the 198-byte GameGuard welcome challenge (hardcoded, same as login server).
-	// The RC4 S-box is seeded from the same key padded to 256 bytes with zeros.
-	// Both sides know this key statically, so they arrive at the same cipher state.
+	// Send the 198-byte GameGuard welcome challenge.
 	pkt := &send.ConnectionClient{}
 	if err := conn.Send(opcode.ConnectionClient, pkt.Encode()); err != nil {
 		s.log.Warn("failed to send ConnectionClient", zap.Error(err))
@@ -80,10 +78,10 @@ func (s *Server) onAccept(conn *network.Conn) {
 		return
 	}
 
-	var sbox [256]byte
-	copy(sbox[:], loginsend.WelcomeKey[:])
-	conn.SetCipher(sbox)
-	s.log.Info("key exchange complete", zap.String("remote", conn.RemoteAddr().String()))
+	// Client encrypts subsequent packets with RC4 per-packet reset using DecryptSbox.
+	// Server responses are always plaintext.
+	conn.SetRecvSbox(crypto.DecryptSbox)
+	s.log.Info("client connected, welcome sent", zap.String("remote", conn.RemoteAddr().String()))
 
 	// Block until the session ends.
 	sess.run()
