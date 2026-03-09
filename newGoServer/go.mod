@@ -1,6 +1,8 @@
 module r2server
 
-go 1.24
+go 1.24.0
+
+toolchain go1.24.4
 
 require (
 	github.com/jackc/pgx/v5 v5.7.2
@@ -19,4 +21,5 @@ require (
 	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/sync v0.11.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
 )

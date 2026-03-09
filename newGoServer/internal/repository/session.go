@@ -38,10 +38,17 @@ func (r *SessionRepository) CreateToken(ctx context.Context, accountID int32, se
 		return 0, fmt.Errorf("CreateToken: redis: %w", err)
 	}
 
-	// Durable audit record (optional but useful for debugging)
+	// Durable audit record (optional but useful for debugging).
+	// During login phase the server is not chosen yet, so serverID can be 0.
+	// Persist NULL in that case to satisfy FK sessions.server_id -> game_servers(id).
+	var dbServerID any = nil
+	if serverID > 0 {
+		dbServerID = serverID
+	}
+
 	_, err = r.db.Exec(ctx,
 		`INSERT INTO sessions (account_id, server_id, token) VALUES ($1, $2, $3)`,
-		accountID, serverID, token,
+		accountID, dbServerID, token,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("CreateToken: db: %w", err)

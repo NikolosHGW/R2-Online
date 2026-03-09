@@ -70,7 +70,6 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) onAccept(conn *network.Conn) {
 	sess := newSession(conn, s)
 
-	// Send the 198-byte GameGuard welcome challenge.
 	pkt := &send.ConnectionClient{}
 	if err := conn.Send(opcode.ConnectionClient, pkt.Encode()); err != nil {
 		s.log.Warn("failed to send ConnectionClient", zap.Error(err))
@@ -78,7 +77,9 @@ func (s *Server) onAccept(conn *network.Conn) {
 		return
 	}
 
-	// Client encrypts subsequent packets with RC4 per-packet reset using DecryptSbox.
+	// The client encrypts all packets with the hardcoded RC4 S-box (DecryptSbox).
+	// WelcomeKey (ConnectionClient payload) is a GameGuard challenge — it is NOT
+	// used for the cipher. The cipher is reset per-packet (fresh S-box each packet).
 	// Server responses are always plaintext.
 	conn.SetRecvSbox(crypto.DecryptSbox)
 	s.log.Info("client connected, welcome sent", zap.String("remote", conn.RemoteAddr().String()))

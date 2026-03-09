@@ -1,12 +1,16 @@
-// Package crypto implements the custom RC4-like stream cipher used by R2 Online.
+// Package crypto implements the stream cipher used by R2 Online.
 //
-// The algorithm is identical to standard RC4 but without the Key Scheduling
-// Algorithm (KSA): the 256-byte S-box is used directly as provided, with the
-// two state pointers (i, j) initialised to zero.
+// The server (FnlApiW.dll, CRc4A::SetKey) uses standard RC4 KSA to derive a
+// 256-element S-box from an 18-byte key (__mKey8 from CTrCryptKeyAck / opcode 1103).
+// The stream cipher itself is also standard RC4, but reset per-packet (fresh S-box
+// state for every received packet, i=0 j=0).
 //
-// This means the "key" sent to the client IS the S-box — the server generates
-// 256 cryptographically random bytes, sends them in the ConnectionClient packet
-// (opcode 1103), and both sides use those bytes as the initial RC4 S-box state.
+// Per-session encryption flow:
+//  1. Server generates a random 18-byte key (GenerateSessionKey).
+//  2. Server derives the S-box via KSA(key) — identical to what CRc4A::SetKey does.
+//  3. Server sends the key embedded in the __mKey8 field of ConnectionClient (1103).
+//  4. Client runs the same KSA on the received __mKey8 and gets the same S-box.
+//  5. All subsequent client→server packets are encrypted with that S-box.
 package crypto
 
 import "crypto/rand"
@@ -24,10 +28,26 @@ func NewRC4(sbox [256]byte) *RC4 {
 	return &RC4{s: sbox}
 }
 
-// GenerateKey generates a cryptographically random 256-byte S-box suitable
-// for seeding NewRC4 and for sending to the client in the ConnectionClient packet.
-func GenerateKey() ([256]byte, error) {
-	var key [256]byte
+// KSA runs the standard RC4 Key Scheduling Algorithm and returns the resulting
+// 256-byte S-box. This matches CRc4A::SetKey in FnlApiW.dll exactly.
+func KSA(key []byte) [256]byte {
+	var s [256]byte
+	for i := range s {
+		s[i] = byte(i)
+	}
+	j := 0
+	for i := 0; i < 256; i++ {
+		j = (j + int(s[i]) + int(key[i%len(key)])) & 0xff
+		s[i], s[j] = s[j], s[i]
+	}
+	return s
+}
+
+// GenerateSessionKey generates a cryptographically random 18-byte key (9 int16 values)
+// for embedding in the __mKey8 field of ConnectionClient (opcode 1103).
+// Derive the session S-box with KSA(key[:]).
+func GenerateSessionKey() ([18]byte, error) {
+	var key [18]byte
 	_, err := rand.Read(key[:])
 	return key, err
 }

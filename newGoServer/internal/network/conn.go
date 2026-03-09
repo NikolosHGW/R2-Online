@@ -1,20 +1,9 @@
 // Package network provides the low-level TCP framing layer for R2 Online.
 //
-// Wire format of every packet:
+// Wire format:
+//   [SIZE:uint16 LE][ENC:uint8][SEQ:uint8][OP:uint16 LE][DATA...]
 //
-//	[SIZE: uint16 LE]  — total bytes from this field onward (includes itself)
-//	[ENC:  uint8]      — 0x00 = plaintext, 0x01 = RC4-encrypted from here
-//	[SEQ:  uint8]      — packet sequence number
-//	[OP:   uint16 LE]  — opcode
-//	[DATA: bytes...]   — payload
-//
-// SIZE = 2 (ENC+SEQ) + 2 (OP) + len(DATA) + 2 (the SIZE field itself) = 6 + len(DATA)
-//
-// Encryption model (discovered from reference implementation):
-//   - Server → Client: always PLAINTEXT (enc_flag = 0x00).
-//   - Client → Server: RC4-encrypted (enc_flag = 0x01) using a hardcoded S-box
-//     (crypto.DecryptSbox). The cipher is RESET to the initial S-box state for
-//     every incoming packet — state does NOT carry over between packets.
+// SIZE includes all bytes starting from SIZE itself.
 package network
 
 import (
@@ -35,24 +24,35 @@ const (
 	encEncrypted = 0x01
 	defaultSeq   = 0x01
 
-	// maxPacketSize guards against malformed/malicious oversized packets.
 	maxPacketSize = 64 * 1024
 )
 
-// Conn is a single TCP connection with R2 Online packet framing.
-// Sends are always plaintext. Receives are decrypted per-packet when enc_flag = 0x01.
-// It is safe to call Send from multiple goroutines; reads must be from a single goroutine.
+type diagSbox struct {
+	name string
+	sbox [256]byte
+}
+
+// Conn is one framed TCP connection.
 type Conn struct {
 	conn net.Conn
 	log  *zap.Logger
 
 	mu sync.Mutex
 
-	// recvSboxSet is true once SetRecvSbox has been called.
-	// When set, incoming packets with enc_flag=0x01 are decrypted using a fresh
-	// RC4 instance seeded from recvSbox for each packet.
 	recvSboxSet bool
 	recvSbox    [256]byte
+	recvDropN   int
+	recvStream  bool
+	recvCipher  *crypto.RC4
+	recvInit    bool
+
+	// Candidate S-boxes for diagnostics.
+	diagSboxes []diagSbox
+
+	// Optional drop-N diagnostic.
+	diagDropTarget uint16
+	diagDropMax    int
+	diagDropSeq    int
 }
 
 func NewConn(c net.Conn, log *zap.Logger) *Conn {
@@ -62,29 +62,65 @@ func NewConn(c net.Conn, log *zap.Logger) *Conn {
 	}
 }
 
-// SetRecvSbox installs the S-box used to decrypt incoming (client→server) packets.
-// The cipher is reset to this initial S-box state for every received packet.
-// Server→client packets are always sent as plaintext.
+// AddDiagSbox adds a candidate sbox for trial decryption logs.
+func (c *Conn) AddDiagSbox(name string, sbox [256]byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.diagSboxes = append(c.diagSboxes, diagSbox{name: name, sbox: sbox})
+}
+
+// SetDiagDropSearch enables search for "drop N keystream bytes before decrypt".
+func (c *Conn) SetDiagDropSearch(targetOpcode uint16, maxDrop int, expectedSeq int) {
+	if maxDrop < 0 {
+		maxDrop = 0
+	}
+	if expectedSeq < -1 {
+		expectedSeq = -1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.diagDropTarget = targetOpcode
+	c.diagDropMax = maxDrop
+	c.diagDropSeq = expectedSeq
+}
+
+// SetRecvSbox installs the incoming decryption sbox.
 func (c *Conn) SetRecvSbox(sbox [256]byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.recvSbox = sbox
 	c.recvSboxSet = true
+	c.recvCipher = nil
+	c.recvInit = false
 }
 
-// RemoteAddr returns the remote address of the connection.
-func (c *Conn) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
+// SetRecvDropN sets how many RC4 keystream bytes to discard before decrypting
+// each packet (reset mode) or once before first packet (stream mode).
+func (c *Conn) SetRecvDropN(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recvDropN = n
+	c.recvCipher = nil
+	c.recvInit = false
 }
 
-// Close closes the underlying TCP connection.
-func (c *Conn) Close() error {
-	return c.conn.Close()
+// SetRecvStreamMode enables/disables continuous RC4 state across packets.
+func (c *Conn) SetRecvStreamMode(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recvStream = enabled
+	c.recvCipher = nil
+	c.recvInit = false
 }
 
-// Send serialises and writes a packet to the wire as plaintext (enc_flag = 0x00).
+func (c *Conn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
+func (c *Conn) Close() error         { return c.conn.Close() }
+
+// Send writes one plaintext packet.
 func (c *Conn) Send(opcode uint16, payload []byte) error {
-	// Build frame: [SIZE][ENC=0x00][SEQ][OP_LO][OP_HI][DATA...]
 	inner := make([]byte, 4+len(payload))
 	inner[0] = encPlain
 	inner[1] = defaultSeq
@@ -96,7 +132,7 @@ func (c *Conn) Send(opcode uint16, payload []byte) error {
 	binary.LittleEndian.PutUint16(frame[:2], size)
 	copy(frame[2:], inner)
 
-	if ce := c.log.Check(zap.DebugLevel, "→ SEND"); ce != nil {
+	if ce := c.log.Check(zap.DebugLevel, "-> SEND"); ce != nil {
 		preview := payload
 		if len(preview) > 64 {
 			preview = preview[:64]
@@ -115,19 +151,15 @@ func (c *Conn) Send(opcode uint16, payload []byte) error {
 	return err
 }
 
-// Recv reads one packet from the wire and returns (opcode, payload, error).
-// Blocks until a complete packet is available or an error occurs.
-// If enc_flag == 0x01 and SetRecvSbox has been called, the body is decrypted
-// using a fresh RC4 instance (per-packet reset).
+// Recv reads and decodes one packet.
 func (c *Conn) Recv() (opcode uint16, payload []byte, err error) {
-	// Read SIZE (2 bytes) — always plaintext
 	var sizeBuf [2]byte
 	if _, err = io.ReadFull(c.conn, sizeBuf[:]); err != nil {
 		return 0, nil, fmt.Errorf("conn: read size: %w", err)
 	}
 	size := binary.LittleEndian.Uint16(sizeBuf[:])
 
-	if ce := c.log.Check(zap.DebugLevel, "← RECV size"); ce != nil {
+	if ce := c.log.Check(zap.DebugLevel, "<- RECV size"); ce != nil {
 		ce.Write(
 			zap.String("raw", hex.EncodeToString(sizeBuf[:])),
 			zap.Uint16("size", size),
@@ -141,7 +173,6 @@ func (c *Conn) Recv() (opcode uint16, payload []byte, err error) {
 		return 0, nil, fmt.Errorf("conn: packet too large: size=%d", size)
 	}
 
-	// Read the rest: [ENC][SEQ][OP_LO][OP_HI][DATA...]
 	inner := make([]byte, size-2)
 	if _, err = io.ReadFull(c.conn, inner); err != nil {
 		return 0, nil, fmt.Errorf("conn: read body: %w", err)
@@ -155,24 +186,72 @@ func (c *Conn) Recv() (opcode uint16, payload []byte, err error) {
 		c.mu.Lock()
 		sboxSet := c.recvSboxSet
 		sbox := c.recvSbox
+		diags := c.diagSboxes
+		dropTarget := c.diagDropTarget
+		dropMax := c.diagDropMax
+		dropSeq := c.diagDropSeq
+		dropN := c.recvDropN
+		stream := c.recvStream
 		c.mu.Unlock()
 
 		if !sboxSet {
 			return 0, nil, fmt.Errorf("conn: encrypted packet but recv sbox not set")
 		}
-		// Fresh RC4 instance for this packet — state does not persist between packets.
-		cipher := crypto.NewRC4(sbox)
+
+		if len(diags) > 0 {
+			rawPreview := body
+			if len(rawPreview) > 16 {
+				rawPreview = rawPreview[:16]
+			}
+			fields := []zap.Field{
+				zap.String("raw_hex", hex.EncodeToString(rawPreview)),
+			}
+			for _, d := range diags {
+				buf := make([]byte, len(body))
+				copy(buf, body)
+				crypto.NewRC4(d.sbox).Crypt(buf)
+				trialOp := uint16(0)
+				if len(buf) >= 3 {
+					trialOp = binary.LittleEndian.Uint16(buf[1:3])
+				}
+				fields = append(fields, zap.String("op_if_"+d.name, fmt.Sprintf("0x%04X(%d)", trialOp, trialOp)))
+				if dropMax > 0 {
+					if n, ok := findDropForOpcode(d.sbox, body, dropTarget, dropMax, dropSeq); ok {
+						fields = append(fields, zap.Int("drop_if_"+d.name, n))
+					}
+				}
+			}
+			c.log.Info("<- ENCRYPTED packet - sbox trial", fields...)
+		}
+
+		var cipher *crypto.RC4
+		if stream {
+			if !c.recvInit || c.recvCipher == nil {
+				c.recvCipher = crypto.NewRC4(sbox)
+				if dropN > 0 {
+					drop := make([]byte, dropN)
+					c.recvCipher.Crypt(drop)
+				}
+				c.recvInit = true
+			}
+			cipher = c.recvCipher
+		} else {
+			cipher = crypto.NewRC4(sbox)
+			if dropN > 0 {
+				drop := make([]byte, dropN)
+				cipher.Crypt(drop)
+			}
+		}
 		cipher.Crypt(body)
 	}
 
-	// body: [SEQ: 1][OP: 2][DATA: N]
 	if len(body) < 3 {
 		return 0, nil, fmt.Errorf("conn: body too short: %d bytes", len(body))
 	}
 	opcode = binary.LittleEndian.Uint16(body[1:3])
 	payload = body[3:]
 
-	if ce := c.log.Check(zap.DebugLevel, "← RECV"); ce != nil {
+	if ce := c.log.Check(zap.DebugLevel, "<- RECV"); ce != nil {
 		encStr := "plain"
 		if encFlag == encEncrypted {
 			encStr = "rc4(fresh)"
@@ -191,4 +270,26 @@ func (c *Conn) Recv() (opcode uint16, payload []byte, err error) {
 	}
 
 	return opcode, payload, nil
+}
+
+func findDropForOpcode(sbox [256]byte, cipherBody []byte, target uint16, maxDrop int, expectedSeq int) (int, bool) {
+	if len(cipherBody) < 3 || maxDrop < 0 {
+		return 0, false
+	}
+	ks := make([]byte, maxDrop+3)
+	crypto.NewRC4(sbox).Crypt(ks) // RC4 keystream from zero input
+
+	for drop := 0; drop <= maxDrop; drop++ {
+		if expectedSeq >= 0 {
+			seq := cipherBody[0] ^ ks[drop]
+			if int(seq) != expectedSeq {
+				continue
+			}
+		}
+		op := uint16(cipherBody[1]^ks[drop+1]) | (uint16(cipherBody[2]^ks[drop+2]) << 8)
+		if op == target {
+			return drop, true
+		}
+	}
+	return 0, false
 }

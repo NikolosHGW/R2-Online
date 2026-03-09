@@ -164,58 +164,39 @@ Keystream[0..63] = 8A 7B 65 7E B7 DC C4 04 1A D7 BF B1 11 3A DF B5
 | Сервер → Клиент | **Всегда plaintext** (enc_flag=0x00) |
 | Клиент → Сервер | **RC4(DecryptSbox)** (enc_flag=0x01), сброс на каждый пакет |
 
-### Что НЕ является хардкодом в клиенте
+### Алгоритм KSA (реверс FnlApiW.dll)
 
-Эксперимент с отправкой нулевого ConnectionClient показал: клиент отключился до отправки
-любого пакета. Содержимое WelcomeKey важно для клиента (в первую очередь `__mIdx=80`
-и, вероятно, `__mKey8` для инициализации S-box).
+Реверс `FnlApiW.dll` (C:\r2_server\lib\Lib\FnlApiW.dll) показал:
 
-`DecryptSbox` (256 байт) — **НЕ** результат стандартного RC4 KSA применённого к `__mKey8`.
-Протестированы все разумные интерпретации (raw bytes, BE-swapped shorts, PLAINTEXTKEYBLOB header,
-16-bit j accumulator) — совпадение 0-2/256 (случайный уровень). `DecryptSbox` — перестановка
-всех значений 0-255, значит какой-то KSA был применён, но алгоритм нестандартный.
+- `FnlApi::CRc4A::SState { int mX; int mY; int mM[256]; }` — S-box хранится как 256 int
+- `CRc4A::SetKey(SState&, const void*, unsigned long)` — **стандартный RC4 KSA**, просто с int32 S-box
+- Разобранные байты функции подтверждают: инициализация `mM[i]=i`, затем стандартный KSA-shuffle с байт-маской j
 
-**Что известно из IDA-заголовков (ChannelW.h):**
-`FnlApi::CRc4A::SState { int mX; int mY; int mM[256]; }` — S-box хранится как 256 int (не byte).
-`FnlApp::CCryptRc4_vtbl::Open(const void*, unsigned int)` — метод инициализации S-box из ключа.
-Тело `Open()` содержит проприетарный алгоритм — для его нахождения нужен динамический анализ
-клиента (x64dbg, breakpoint на обработке пакета 1103).
+Значит клиент тоже использует стандартный RC4 KSA для вычисления S-box из `__mKey8`.
 
 ---
 
-## Проблема текущего шифрования
+## Per-session шифрование (реализовано)
 
-Keystream одинаковый для всех клиентов и всех сессий (WelcomeKey и DecryptSbox захардкожены
-на сервере). Кто знает WelcomeKey — может расшифровать трафик любого игрока.
+**РЕАЛИЗОВАНО** в текущем коде. Алгоритм:
 
----
-
-## Как сделать нормальное шифрование (требует правки клиента)
-
-### Что нужно
-
-1. Найти в клиенте функцию которая читает `__mKey8` из CTrCryptKeyAck и строит S-box
-   → Инструменты: x64dbg + FieldW.exe, поставить breakpoint на получение пакета 1103
-2. Реализовать тот же алгоритм на сервере (`crypto/ksa.go`)
-3. При каждом новом подключении генерировать случайный `__mKey8` (18 байт)
-4. Вычислять S-box через найденный алгоритм
-5. Встроить случайный `__mKey8` в WelcomeKey на нужном смещении
-6. Вызвать `conn.SetRecvSbox(sessionSbox)` вместо фиксированного `crypto.DecryptSbox`
-
-### Что изменится в серверном коде
+1. Сервер генерирует случайные 18 байт (`crypto.GenerateSessionKey()`)
+2. Встраивает их в `__mKey8` (смещение 155) WelcomeKey
+3. Вычисляет S-box через `crypto.KSA(key8[:])` — стандартный RC4 KSA
+4. Отправляет ConnectionClient с этим WelcomeKey
+5. Клиент читает `__mKey8`, запускает тот же KSA → получает тот же S-box
+6. Все последующие пакеты клиента зашифрованы этим уникальным S-box
 
 ```go
-// Сейчас:
-conn.Send(opcode.ConnectionClient, pkt.Encode())  // фиксированный WelcomeKey
-conn.SetRecvSbox(crypto.DecryptSbox)              // фиксированный S-box
-
-// После (когда алгоритм KSA будет известен):
-key8 := crypto.RandomKey8()                       // 18 случайных байт
-payload := crypto.BuildWelcomeKey(key8)           // WelcomeKey с нашим __mKey8
-sessionSbox := crypto.KSA(key8)                   // S-box из ключа
-conn.Send(opcode.ConnectionClient, payload)
-conn.SetRecvSbox(sessionSbox)                     // уникальный per-session S-box
+// Реализация в login/server.go и game/server.go:
+key8, _ := crypto.GenerateSessionKey()           // 18 случайных байт
+pkt := &send.ConnectionClient{Key8: key8}        // __mKey8 в WelcomeKey
+conn.Send(opcode.ConnectionClient, pkt.Encode()) // клиент получает ключ
+conn.SetRecvSbox(crypto.KSA(key8[:]))            // уникальный per-session S-box
 ```
+
+Каждое соединение теперь имеет уникальный S-box. Перехват трафика одного игрока
+не позволяет расшифровать трафик другого.
 
 ---
 

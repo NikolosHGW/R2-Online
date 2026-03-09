@@ -1,7 +1,11 @@
 // Package send contains outgoing (Server→Client) packet encoders for the Login Server.
 package send
 
-import "r2server/internal/network"
+import (
+	"fmt"
+
+	"r2server/internal/network"
+)
 
 // WelcomeKey is the hardcoded 198-byte payload sent in opcode 1103 (ConnectionClient).
 //
@@ -28,11 +32,45 @@ var WelcomeKey = [198]byte{
 }
 
 // ConnectionClient is opcode 1103 — the first packet the server sends on any connection.
-// Payload is the raw WelcomeKey bytes.
-type ConnectionClient struct{}
+// Sends the hardcoded WelcomeKey payload (GameGuard challenge).
+// The WelcomeKey bytes are NOT used for cipher — the game protocol uses a hardcoded
+// RC4 S-box (crypto.DecryptSbox) that is independent of this payload.
+type ConnectionClient struct {
+	Payload []byte
+}
 
 func (p *ConnectionClient) Encode() []byte {
 	w := network.NewWriter()
-	w.WriteBytes(WelcomeKey[:])
+	if len(p.Payload) == 0 {
+		w.WriteBytes(WelcomeKey[:])
+		return w.Bytes()
+	}
+	w.WriteBytes(p.Payload)
 	return w.Bytes()
+}
+
+// CloneWelcomeKey returns a mutable copy of the static 1103 payload.
+func CloneWelcomeKey() []byte {
+	out := make([]byte, len(WelcomeKey))
+	copy(out, WelcomeKey[:])
+	return out
+}
+
+// WriteSessionKey writes an 18-byte key into payload at offset.
+func WriteSessionKey(payload []byte, offset int, key [18]byte) error {
+	if offset < 0 || offset+len(key) > len(payload) {
+		return fmt.Errorf("session key offset out of range: offset=%d payload_len=%d", offset, len(payload))
+	}
+	copy(payload[offset:offset+len(key)], key[:])
+	return nil
+}
+
+// ReadSessionKey reads an 18-byte key from payload at offset.
+func ReadSessionKey(payload []byte, offset int) ([18]byte, error) {
+	var key [18]byte
+	if offset < 0 || offset+len(key) > len(payload) {
+		return key, fmt.Errorf("session key offset out of range: offset=%d payload_len=%d", offset, len(payload))
+	}
+	copy(key[:], payload[offset:offset+len(key)])
+	return key, nil
 }

@@ -1,10 +1,18 @@
-.PHONY: login game docker-up docker-down migrate tidy
+.PHONY: login game memscanner docker-up docker-down migrate tidy
 
 login:
 	go run ./cmd/login
 
 game:
 	go run ./cmd/game
+
+# memscanner: Windows-only RC4 memory scanner.
+# Usage: make memscanner PROC=R2ClientRU.exe
+#        make memscanner PROC=R2ClientRU.exe DUMP=0x7FF600010000
+PROC ?= R2ClientRU.exe
+DUMP ?=
+memscanner:
+	go run ./cmd/memscanner -proc $(PROC) $(if $(DUMP),-dump $(DUMP),)
 
 build:
 	go build ./cmd/login
